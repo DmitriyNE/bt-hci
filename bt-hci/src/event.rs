@@ -1418,11 +1418,8 @@ mod tests {
             0x00, // abort_reason
             0x01, // num_antenna_paths = 1
             0x02, // num_steps_reported = 2
-            0x01, 0x02, // step_mode [1, 2]
-            0x0A, 0x14, // step_channel [10, 20]
-            0x02, 0x03, // step_data_length [2, 3]
-            0xBE, 0xEF, // step_data[0]
-            0xAA, 0xBB, 0xCC, // step_data[1]
+            0x01, 0x0A, 0x02, 0xBE, 0xEF, // step 0: mode 1, channel 10, 2 data bytes
+            0x02, 0x14, 0x03, 0xAA, 0xBB, 0xCC, // step 1: mode 2, channel 20, 3 data bytes
         ];
         let event = EventPacket::from_hci_bytes_complete(&data).unwrap();
         assert!(matches!(event.kind, EventKind::Le));
@@ -1475,6 +1472,19 @@ mod tests {
         let _ = iter.next();
         assert_eq!(iter.len(), 0);
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn parse_le_cs_step_data_rejects_truncated_step() {
+        // Two steps reported, but the second step's data is one byte short.
+        let data = [0x02, 0x01, 0x0A, 0x02, 0xBE, 0xEF, 0x02, 0x14, 0x03, 0xAA, 0xBB];
+        assert!(LeCsSubeventStepData::from_hci_bytes(&data).is_err());
+
+        // Bytes after the last reported step are ignored.
+        let data = [0x01, 0x01, 0x0A, 0x01, 0xBE, 0x00];
+        let (steps, _) = LeCsSubeventStepData::from_hci_bytes(&data).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps.get(0).unwrap().step_data, &[0xBE]);
     }
 
     #[test]
