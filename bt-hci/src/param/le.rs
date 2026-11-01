@@ -1086,8 +1086,10 @@ param! {
 
 /// Container for CS subevent step data.
 ///
-/// Parses the column-major wire format:
-/// `num_steps_reported | step_mode[] | step_channel[] | step_data_length[] | step_data[]`
+/// Parses the wire format `num_steps_reported`, followed by each step in turn:
+/// `step_mode | step_channel | step_data_length | step_data[step_data_length]`.
+/// This is the layout controllers send; Zephyr's `bt_le_cs_step_data_parse` reads it the same
+/// way. Every reported step is validated while parsing; bytes after the last one are ignored.
 ///
 /// Entries are accessed via [`get`](LeCsSubeventStepData::get)
 /// or [`iter`](LeCsSubeventStepData::iter).
@@ -1095,10 +1097,8 @@ param! {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct LeCsSubeventStepData<'a> {
     num_steps_reported: u8,
-    step_mode: &'a [u8],
-    step_channel: &'a [u8],
-    step_data_length: &'a [u8],
-    step_data: &'a [u8],
+    /// Exactly `num_steps_reported` well-formed steps.
+    steps: &'a [u8],
 }
 
 impl<'a> LeCsSubeventStepData<'a> {
@@ -1113,42 +1113,50 @@ impl<'a> LeCsSubeventStepData<'a> {
     }
 
     /// Returns the step entry at the given index, or `None` if out of bounds.
+    ///
+    /// Steps vary in length, so this walks from the first step; prefer
+    /// [`iter`](LeCsSubeventStepData::iter) to visit them all.
     pub fn get(&self, index: usize) -> Option<LeCsSubeventStepEntry<'a>> {
-        if index >= self.len() {
-            return None;
-        }
-        let data_offset: usize = self.step_data_length[..index].iter().map(|&l| l as usize).sum();
-        let data_len = self.step_data_length[index] as usize;
-        Some(LeCsSubeventStepEntry {
-            step_mode: self.step_mode[index],
-            step_channel: self.step_channel[index],
-            step_data_length: self.step_data_length[index],
-            step_data: &self.step_data[data_offset..data_offset + data_len],
-        })
+        self.iter().nth(index)
     }
 
     /// Returns an iterator over all step entries.
-    pub fn iter(&self) -> LeCsSubeventStepDataIter<'_> {
-        LeCsSubeventStepDataIter { data: self, index: 0 }
+    pub fn iter(&self) -> LeCsSubeventStepDataIter<'a> {
+        LeCsSubeventStepDataIter {
+            steps: self.steps,
+            remaining: self.len(),
+        }
     }
+}
+
+/// Splits the first step off `data`, or returns `None` if `data` is too short to hold it.
+fn split_step(data: &[u8]) -> Option<(LeCsSubeventStepEntry<'_>, &[u8])> {
+    let [step_mode, step_channel, step_data_length, rest @ ..] = data else {
+        return None;
+    };
+    let (step_data, rest) = rest.split_at_checked(usize::from(*step_data_length))?;
+    Some((
+        LeCsSubeventStepEntry {
+            step_mode: *step_mode,
+            step_channel: *step_channel,
+            step_data_length: *step_data_length,
+            step_data,
+        },
+        rest,
+    ))
 }
 
 impl<'de> FromHciBytes<'de> for LeCsSubeventStepData<'de> {
     fn from_hci_bytes(data: &'de [u8]) -> Result<(Self, &'de [u8]), FromHciBytesError> {
         let (num_steps_reported, data) = u8::from_hci_bytes(data)?;
-        let n = num_steps_reported as usize;
-
-        let (step_mode, data) = read_n::<u8>(data, n)?;
-        let (step_channel, data) = read_n::<u8>(data, n)?;
-        let (step_data_length, data) = read_n::<u8>(data, n)?;
-
+        let mut rest = data;
+        for _ in 0..num_steps_reported {
+            rest = split_step(rest).ok_or(FromHciBytesError::InvalidSize)?.1;
+        }
         Ok((
             Self {
                 num_steps_reported,
-                step_mode,
-                step_channel,
-                step_data_length,
-                step_data: data,
+                steps: &data[..data.len() - rest.len()],
             },
             &[],
         ))
@@ -1157,28 +1165,32 @@ impl<'de> FromHciBytes<'de> for LeCsSubeventStepData<'de> {
 
 /// An iterator over LeCsSubeventStepEntry values.
 pub struct LeCsSubeventStepDataIter<'a> {
-    data: &'a LeCsSubeventStepData<'a>,
-    index: usize,
+    steps: &'a [u8],
+    remaining: usize,
 }
 
 impl<'a> Iterator for LeCsSubeventStepDataIter<'a> {
     type Item = LeCsSubeventStepEntry<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let entry = self.data.get(self.index)?;
-        self.index += 1;
+        if self.remaining == 0 {
+            return None;
+        }
+        // Validated when parsed, so this does not fail.
+        let (entry, rest) = split_step(self.steps)?;
+        self.steps = rest;
+        self.remaining -= 1;
         Some(entry)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.data.len() - self.index;
-        (remaining, Some(remaining))
+        (self.remaining, Some(self.remaining))
     }
 }
 
 impl ExactSizeIterator for LeCsSubeventStepDataIter<'_> {
     fn len(&self) -> usize {
-        self.data.len() - self.index
+        self.remaining
     }
 }
 
